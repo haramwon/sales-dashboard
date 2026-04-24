@@ -1,0 +1,726 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Sales Dashboard · 테스트셋</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600&display=swap" rel="stylesheet">
+<script src="https://cdn.tailwindcss.com"></script>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/prop-types@15.8.1/prop-types.min.js"></script>
+<script crossorigin src="https://unpkg.com/recharts@2.12.7/umd/Recharts.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script>
+  tailwind.config = {
+    theme: {
+      extend: {
+        fontFamily: {
+          sans: ['"IBM Plex Sans"', 'system-ui', 'sans-serif'],
+          mono: ['"JetBrains Mono"', 'ui-monospace', 'monospace'],
+        },
+        colors: {
+          bg: '#FAFAF8',
+          card: '#FFFFFF',
+          border: '#E7E5E0',
+          ink: '#1C1B18',
+          muted: '#6B6A63',
+          accent: '#0F4C3A',
+          good: '#2D6A4F',
+          warn: '#B45309',
+          bad:  '#B91C1C',
+        },
+      },
+    },
+  };
+</script>
+<style>
+  html, body { background: #FAFAF8; }
+  body { font-family: 'IBM Plex Sans', system-ui, sans-serif; color: #1C1B18; }
+  .num { font-family: 'JetBrains Mono', ui-monospace, monospace; font-variant-numeric: tabular-nums; }
+  /* 부드러운 border radius (획일적 rounded-2xl 회피) */
+  .card { border: 1px solid #E7E5E0; background: #fff; border-radius: 6px; }
+  .chip { border: 1px solid #E7E5E0; background: #fff; border-radius: 999px; padding: 4px 10px; font-size: 12px; color: #1C1B18; cursor: pointer; user-select: none; }
+  .chip.on { background: #1C1B18; color: #fff; border-color: #1C1B18; }
+  .chip:hover { background: #F2F1ED; }
+  .chip.on:hover { background: #000; }
+  select, input[type="date"] { border: 1px solid #E7E5E0; background: #fff; padding: 6px 10px; font-size: 13px; border-radius: 4px; }
+  table { border-collapse: collapse; }
+  th, td { border-bottom: 1px solid #EFEEEA; padding: 8px 10px; text-align: left; }
+  th { font-size: 12px; color: #6B6A63; font-weight: 500; text-transform: uppercase; letter-spacing: .04em; background: #FAFAF8; position: sticky; top: 0; }
+  tbody tr:hover { background: #FAFAF8; }
+  .skeleton { background: linear-gradient(90deg, #F2F1ED 0%, #E7E5E0 50%, #F2F1ED 100%); background-size: 200% 100%; animation: shimmer 1.4s infinite; border-radius: 4px; }
+  @keyframes shimmer { 0% { background-position: 200% 0 } 100% { background-position: -200% 0 } }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+/* =========================================================================
+ *  Config — 시트 ID/탭명/새로고침 주기는 번들에 그대로 포함됨
+ *  (SKILL.md § Google Sheets > Required Implementation Elements 참조)
+ * ========================================================================= */
+const CONFIG = {
+  SHEET_ID: '1aw66Y6myVMfEEB1TLwnRSJcero0iGipF7T0Bem1rdQA',
+  SHEET_NAME: 'sales_data_10000',
+  REFRESH_MS: 5 * 60 * 1000, // 5분마다 자동 새로고침
+};
+// 엔드포인트 3종 — 순차적으로 시도하여 fetch 실패를 완화
+const GVIZ_JSON_URL =
+  `https://docs.google.com/spreadsheets/d/${CONFIG.SHEET_ID}` +
+  `/gviz/tq?tqx=out:json&sheet=${encodeURIComponent(CONFIG.SHEET_NAME)}`;
+const GVIZ_CSV_URL =
+  `https://docs.google.com/spreadsheets/d/${CONFIG.SHEET_ID}` +
+  `/gviz/tq?tqx=out:csv&sheet=${encodeURIComponent(CONFIG.SHEET_NAME)}`;
+const EXPORT_CSV_URL =
+  `https://docs.google.com/spreadsheets/d/${CONFIG.SHEET_ID}` +
+  `/export?format=csv`;
+
+// file:// 프로토콜 감지 (가장 흔한 Failed to fetch 원인)
+const IS_FILE_PROTOCOL = (typeof window !== 'undefined') && window.location.protocol === 'file:';
+
+const { useState, useEffect, useMemo, useCallback } = React;
+const {
+  ResponsiveContainer, LineChart, Line, BarChart, Bar, PieChart, Pie, Cell,
+  XAxis, YAxis, CartesianGrid, Tooltip, Legend,
+} = Recharts;
+
+/* =========================================================================
+ *  데이터 계층 — 3가지 엔드포인트 순차 시도 + 에러 타입 구분
+ * ========================================================================= */
+
+// 간이 CSV 파서 (따옴표로 감싼 필드 및 이스케이프 처리)
+function parseCsv(text) {
+  const rows = [];
+  let row = [], field = '', inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (text[i + 1] === '"') { field += '"'; i++; }
+        else { inQuotes = false; }
+      } else { field += ch; }
+    } else {
+      if (ch === '"') inQuotes = true;
+      else if (ch === ',') { row.push(field); field = ''; }
+      else if (ch === '\n') { row.push(field); rows.push(row); row = []; field = ''; }
+      else if (ch === '\r') { /* skip */ }
+      else { field += ch; }
+    }
+  }
+  if (field.length > 0 || row.length > 0) { row.push(field); rows.push(row); }
+  return rows.filter(r => r.some(c => c !== ''));
+}
+
+function csvRowsToObjects(rows) {
+  if (rows.length === 0) return [];
+  const headers = rows[0];
+  return rows.slice(1).map(r => {
+    const obj = {};
+    headers.forEach((h, i) => {
+      const v = r[i];
+      // 숫자로 변환 가능한 필드는 Number 처리
+      const num = Number(v);
+      obj[h] = v === '' ? null : (!isNaN(num) && v != null && v.trim() !== '' ? num : v);
+    });
+    return obj;
+  });
+}
+
+function parseGvizJson(text) {
+  const m = text.match(/google\.visualization\.Query\.setResponse\(([\s\S]+)\);?\s*$/)
+         || text.match(/\(([\s\S]*)\)\s*;?\s*$/);
+  if (!m) throw new Error('gviz 응답 형식을 해석할 수 없습니다.');
+  const json = JSON.parse(m[1]);
+  if (!json.table || !json.table.rows) throw new Error('시트가 비어있거나 구조가 다릅니다.');
+  const cols = json.table.cols.map(c => c.label || c.id);
+  return json.table.rows.map(r => {
+    const obj = {};
+    r.c.forEach((cell, i) => {
+      if (!cell) { obj[cols[i]] = null; return; }
+      const v = cell.v;
+      obj[cols[i]] = (typeof v === 'string' && v.startsWith('Date(')) ? (cell.f || v) : v;
+    });
+    return obj;
+  });
+}
+
+async function tryFetch(url, label) {
+  const res = await fetch(url, { cache: 'no-store' });
+  if (!res.ok) {
+    const err = new Error(`[${label}] HTTP ${res.status} ${res.statusText}`);
+    err.kind = 'http';
+    err.status = res.status;
+    throw err;
+  }
+  return res.text();
+}
+
+async function fetchSheetData() {
+  const attempts = [];
+  // 1차: gviz JSON
+  try {
+    const text = await tryFetch(GVIZ_JSON_URL, 'gviz-json');
+    const rows = parseGvizJson(text);
+    return { rows, source: 'gviz JSON' };
+  } catch (e) {
+    attempts.push({ label: 'gviz JSON', message: e.message, kind: e.kind || 'network' });
+  }
+  // 2차: gviz CSV
+  try {
+    const text = await tryFetch(GVIZ_CSV_URL, 'gviz-csv');
+    const rows = csvRowsToObjects(parseCsv(text));
+    return { rows, source: 'gviz CSV' };
+  } catch (e) {
+    attempts.push({ label: 'gviz CSV', message: e.message, kind: e.kind || 'network' });
+  }
+  // 3차: export CSV (첫 번째 탭만)
+  try {
+    const text = await tryFetch(EXPORT_CSV_URL, 'export-csv');
+    const rows = csvRowsToObjects(parseCsv(text));
+    return { rows, source: 'export CSV (첫 번째 탭)' };
+  } catch (e) {
+    attempts.push({ label: 'export CSV', message: e.message, kind: e.kind || 'network' });
+  }
+  const err = new Error('세 가지 엔드포인트 모두 실패');
+  err.attempts = attempts;
+  throw err;
+}
+
+/* =========================================================================
+ *  포맷터
+ * ========================================================================= */
+const fmtInt = (n) => (n == null ? '-' : Math.round(n).toLocaleString('ko-KR'));
+const fmtMoney = (n) => (n == null ? '-' : '$' + Math.round(n).toLocaleString('ko-KR'));
+const fmtPct = (n) => (n == null ? '-' : n.toFixed(1) + '%');
+const fmtShort = (n) => {
+  if (n == null) return '-';
+  const abs = Math.abs(n);
+  if (abs >= 1e9) return (n / 1e9).toFixed(1) + 'B';
+  if (abs >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+  if (abs >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+  return n.toFixed(0);
+};
+
+/* =========================================================================
+ *  상태별 렌더 — Skeleton / Error / Empty
+ *  (SKILL.md § Required Implementation Elements: 3개 상태 분리 원칙)
+ * ========================================================================= */
+function Skeleton() {
+  return (
+    <div className="p-6 space-y-4">
+      <div className="skeleton h-7 w-64" />
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+        {[0,1,2,3].map(i => <div key={i} className="skeleton h-24" />)}
+      </div>
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <div className="skeleton h-72" />
+        <div className="skeleton h-72" />
+      </div>
+      <div className="skeleton h-96" />
+    </div>
+  );
+}
+
+function ErrorView({ message, attempts, onRetry }) {
+  const isFetchFail = message && message.toLowerCase().includes('failed to fetch');
+  return (
+    <div className="p-8 max-w-3xl mx-auto space-y-4">
+      {IS_FILE_PROTOCOL && (
+        <div className="card p-4 border-l-4 border-l-warn bg-amber-50">
+          <div className="text-sm font-semibold text-warn">⚠ file:// 프로토콜로 열림 — 이것이 원인일 확률이 가장 높습니다</div>
+          <div className="mt-2 text-sm text-ink">
+            HTML 파일을 더블클릭으로 열면 브라우저가 Google의 CORS 응답을 거부합니다. 파일이 있는 폴더에서 아래 중 하나를 실행한 뒤 <span className="num">http://localhost:8000/</span>로 접속하세요.
+          </div>
+          <pre className="mt-2 bg-ink text-white text-xs p-2 rounded overflow-x-auto num">python3 -m http.server 8000</pre>
+          <pre className="mt-1 bg-ink text-white text-xs p-2 rounded overflow-x-auto num">npx serve .</pre>
+        </div>
+      )}
+      <div className="card p-6 border-l-4 border-l-bad">
+        <div className="text-sm uppercase tracking-wide text-bad font-semibold">데이터 로드 실패</div>
+        <div className="mt-2 text-sm text-ink num">{message}</div>
+
+        {attempts && attempts.length > 0 && (
+          <div className="mt-4">
+            <div className="text-xs font-semibold text-muted uppercase tracking-wide">시도한 엔드포인트</div>
+            <ul className="mt-1 text-xs space-y-1">
+              {attempts.map((a, i) => (
+                <li key={i} className="num">
+                  <span className="text-bad">✗</span> <b>{a.label}</b> — {a.message}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+
+        {isFetchFail && (
+          <div className="mt-4 text-xs text-ink space-y-1">
+            <div className="font-semibold">가능한 원인 체크리스트</div>
+            <ol className="list-decimal list-inside space-y-1 text-muted">
+              <li>HTML을 <span className="num">file://</span>로 연 경우 → 위 로컬 서버 안내 참조</li>
+              <li>조직 Workspace 정책으로 외부 공유가 차단됨 → 시크릿창에서 시트 URL 열어 테스트</li>
+              <li>광고 차단기/사내 프록시가 <span className="num">docs.google.com</span> 트래픽 차단 → 확장프로그램 비활성화</li>
+              <li>시트 공유가 "제한됨" 상태 → 공유 창에서 "링크가 있는 모든 사용자 - 뷰어"로 변경</li>
+            </ol>
+            <div className="mt-2 pt-2 border-t border-border">
+              확실한 우회법: 시트에서 <b>파일 → 공유 → 웹에 게시 → 전체 문서 → 게시</b>를 실행하면 CORS 헤더가 더 관대한 엔드포인트가 생성됩니다.
+            </div>
+          </div>
+        )}
+
+        <button onClick={onRetry} className="mt-4 px-3 py-1.5 bg-ink text-white text-sm rounded hover:bg-black">다시 시도</button>
+      </div>
+    </div>
+  );
+}
+
+function EmptyView() {
+  return (
+    <div className="p-8 text-center text-muted text-sm">
+      조건에 맞는 데이터가 없습니다. 필터를 조정해 보세요.
+    </div>
+  );
+}
+
+/* =========================================================================
+ *  KPI 타일
+ * ========================================================================= */
+function KpiCard({ label, value, sub, tone }) {
+  const toneCls = { good: 'text-good', bad: 'text-bad', warn: 'text-warn' }[tone] || 'text-ink';
+  return (
+    <div className="card p-4">
+      <div className="text-xs uppercase tracking-wide text-muted">{label}</div>
+      <div className={`mt-2 text-2xl num font-semibold ${toneCls}`}>{value}</div>
+      {sub && <div className="mt-1 text-xs text-muted num">{sub}</div>}
+    </div>
+  );
+}
+
+/* =========================================================================
+ *  필터바
+ * ========================================================================= */
+function FilterBar({ allRegions, allSegments, allCategories, filters, setFilters, dateBounds, onReset }) {
+  const toggle = (key, v) => {
+    setFilters(prev => {
+      const set = new Set(prev[key]);
+      set.has(v) ? set.delete(v) : set.add(v);
+      return { ...prev, [key]: [...set] };
+    });
+  };
+  return (
+    <div className="card p-4 space-y-3">
+      <div className="flex items-center justify-between">
+        <div className="text-sm font-semibold">필터</div>
+        <button onClick={onReset} className="text-xs text-muted hover:text-ink underline">초기화</button>
+      </div>
+      <div className="flex flex-wrap items-center gap-3">
+        <label className="text-xs text-muted flex items-center gap-2">
+          시작일
+          <input type="date" value={filters.from} min={dateBounds.min} max={dateBounds.max}
+                 onChange={e => setFilters(p => ({ ...p, from: e.target.value }))} />
+        </label>
+        <label className="text-xs text-muted flex items-center gap-2">
+          종료일
+          <input type="date" value={filters.to} min={dateBounds.min} max={dateBounds.max}
+                 onChange={e => setFilters(p => ({ ...p, to: e.target.value }))} />
+        </label>
+      </div>
+      <div>
+        <div className="text-xs text-muted mb-1.5">Region</div>
+        <div className="flex flex-wrap gap-1.5">
+          {allRegions.map(r => (
+            <span key={r} className={`chip ${filters.regions.includes(r) ? 'on' : ''}`} onClick={() => toggle('regions', r)}>{r}</span>
+          ))}
+        </div>
+      </div>
+      <div>
+        <div className="text-xs text-muted mb-1.5">Segment</div>
+        <div className="flex flex-wrap gap-1.5">
+          {allSegments.map(s => (
+            <span key={s} className={`chip ${filters.segments.includes(s) ? 'on' : ''}`} onClick={() => toggle('segments', s)}>{s}</span>
+          ))}
+        </div>
+      </div>
+      <div>
+        <div className="text-xs text-muted mb-1.5">Category</div>
+        <div className="flex flex-wrap gap-1.5">
+          {allCategories.map(c => (
+            <span key={c} className={`chip ${filters.categories.includes(c) ? 'on' : ''}`} onClick={() => toggle('categories', c)}>{c}</span>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* =========================================================================
+ *  차트 색상 팔레트 — 보라 그라데이션 회피, 흙·청록 계열
+ * ========================================================================= */
+const PALETTE = ['#0F4C3A', '#B45309', '#1C1B18', '#7C6F5E', '#2D6A4F', '#8C3A2E', '#4A6D8C'];
+
+/* =========================================================================
+ *  집계 유틸
+ * ========================================================================= */
+function groupSum(rows, key, valueKey) {
+  const m = new Map();
+  for (const r of rows) {
+    const k = r[key];
+    m.set(k, (m.get(k) || 0) + (Number(r[valueKey]) || 0));
+  }
+  return [...m.entries()].map(([k, v]) => ({ key: k, value: v }));
+}
+
+function groupAgg(rows, key) {
+  const m = new Map();
+  for (const r of rows) {
+    const k = r[key];
+    if (!m.has(k)) m.set(k, { key: k, revenue: 0, profit: 0, units: 0, orders: 0 });
+    const o = m.get(k);
+    o.revenue += Number(r.TotalRevenue) || 0;
+    o.profit  += Number(r.Profit) || 0;
+    o.units   += Number(r.UnitsSold) || 0;
+    o.orders  += 1;
+  }
+  return [...m.values()];
+}
+
+/* =========================================================================
+ *  메인 App
+ * ========================================================================= */
+function App() {
+  const [data, setData] = useState(null);
+  const [error, setError] = useState(null);
+  const [errorAttempts, setErrorAttempts] = useState(null);
+  const [source, setSource] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [lastFetched, setLastFetched] = useState(null);
+
+  const load = useCallback(async () => {
+    setLoading(true); setError(null); setErrorAttempts(null);
+    try {
+      const { rows, source } = await fetchSheetData();
+      setData(rows);
+      setSource(source);
+      setLastFetched(new Date());
+    } catch (e) {
+      setError(e.message || '알 수 없는 오류');
+      setErrorAttempts(e.attempts || null);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  // 최초 로드 + 자동 새로고침
+  useEffect(() => {
+    load();
+    const t = setInterval(load, CONFIG.REFRESH_MS);
+    return () => clearInterval(t);
+  }, [load]);
+
+  // 전체 데이터에서 추출한 선택지
+  const allRegions = useMemo(() => data ? [...new Set(data.map(r => r.Region).filter(Boolean))].sort() : [], [data]);
+  const allSegments = useMemo(() => data ? [...new Set(data.map(r => r.Segment).filter(Boolean))].sort() : [], [data]);
+  const allCategories = useMemo(() => data ? [...new Set(data.map(r => r.Category).filter(Boolean))].sort() : [], [data]);
+  const dateBounds = useMemo(() => {
+    if (!data || data.length === 0) return { min: '', max: '' };
+    const ds = data.map(r => r.Date).filter(Boolean).sort();
+    return { min: ds[0], max: ds[ds.length - 1] };
+  }, [data]);
+
+  // 필터 상태
+  const [filters, setFilters] = useState({ from: '', to: '', regions: [], segments: [], categories: [] });
+  useEffect(() => {
+    // 데이터가 들어오면 날짜 범위 기본값 세팅
+    if (dateBounds.min && !filters.from) setFilters(p => ({ ...p, from: dateBounds.min, to: dateBounds.max }));
+  }, [dateBounds.min, dateBounds.max]); // eslint-disable-line
+
+  const onReset = () => setFilters({ from: dateBounds.min, to: dateBounds.max, regions: [], segments: [], categories: [] });
+
+  // 필터 적용된 행
+  const filteredRows = useMemo(() => {
+    if (!data) return [];
+    return data.filter(r => {
+      if (!r.Date) return false;
+      if (filters.from && r.Date < filters.from) return false;
+      if (filters.to && r.Date > filters.to) return false;
+      if (filters.regions.length && !filters.regions.includes(r.Region)) return false;
+      if (filters.segments.length && !filters.segments.includes(r.Segment)) return false;
+      if (filters.categories.length && !filters.categories.includes(r.Category)) return false;
+      return true;
+    });
+  }, [data, filters]);
+
+  // KPI
+  const kpi = useMemo(() => {
+    const rev = filteredRows.reduce((s, r) => s + (Number(r.TotalRevenue) || 0), 0);
+    const prof = filteredRows.reduce((s, r) => s + (Number(r.Profit) || 0), 0);
+    const units = filteredRows.reduce((s, r) => s + (Number(r.UnitsSold) || 0), 0);
+    const orders = filteredRows.length;
+    const margin = rev ? (prof / rev) * 100 : 0;
+    const aov = orders ? rev / orders : 0;
+    return { rev, prof, units, orders, margin, aov };
+  }, [filteredRows]);
+
+  // 일자별 매출 추이
+  const dailyRevenue = useMemo(() => {
+    const m = new Map();
+    for (const r of filteredRows) {
+      const d = r.Date;
+      if (!d) continue;
+      if (!m.has(d)) m.set(d, { date: d, revenue: 0, profit: 0 });
+      const o = m.get(d);
+      o.revenue += Number(r.TotalRevenue) || 0;
+      o.profit  += Number(r.Profit) || 0;
+    }
+    return [...m.values()].sort((a, b) => a.date.localeCompare(b.date));
+  }, [filteredRows]);
+
+  // Region별 집계
+  const byRegion = useMemo(() => groupAgg(filteredRows, 'Region').sort((a, b) => b.revenue - a.revenue), [filteredRows]);
+
+  // Category별 매출 & 이익
+  const byCategory = useMemo(() => groupAgg(filteredRows, 'Category').sort((a, b) => b.revenue - a.revenue), [filteredRows]);
+
+  // Segment별 매출 비중
+  const bySegment = useMemo(() => groupSum(filteredRows, 'Segment', 'TotalRevenue').sort((a, b) => b.value - a.value), [filteredRows]);
+
+  // Top10 Product by Revenue
+  const topProducts = useMemo(() => {
+    return groupAgg(filteredRows, 'Product').sort((a, b) => b.revenue - a.revenue).slice(0, 10);
+  }, [filteredRows]);
+
+  // 테이블 페이지네이션
+  const [page, setPage] = useState(0);
+  const [perPage] = useState(25);
+  useEffect(() => setPage(0), [filters]);
+  const pages = Math.max(1, Math.ceil(filteredRows.length / perPage));
+  const pageRows = filteredRows.slice(page * perPage, (page + 1) * perPage);
+
+  // ---------- 렌더 분기 ----------
+  if (loading && !data) return <Skeleton />;
+  if (error) return <ErrorView message={error} attempts={errorAttempts} onRetry={load} />;
+
+  return (
+    <div className="min-h-screen">
+      {/* Top bar */}
+      <header className="border-b border-border bg-white">
+        <div className="max-w-[1400px] mx-auto px-6 py-4 flex items-center justify-between">
+          <div>
+            <div className="text-xs uppercase tracking-wider text-muted">Google Sheets Dashboard</div>
+            <h1 className="text-xl font-semibold mt-0.5">매출 분석 · 테스트셋</h1>
+          </div>
+          <div className="text-xs text-muted text-right">
+            <div>탭: <span className="num">{CONFIG.SHEET_NAME}</span></div>
+            <div>소스: <span className="num text-ink">{source || '-'}</span></div>
+            <div>마지막 업데이트: <span className="num">{lastFetched ? lastFetched.toLocaleString('ko-KR') : '-'}</span></div>
+            <button onClick={load} className="mt-1 text-ink underline hover:no-underline">수동 새로고침</button>
+          </div>
+        </div>
+      </header>
+
+      <main className="max-w-[1400px] mx-auto px-6 py-6 grid grid-cols-1 lg:grid-cols-[280px_1fr] gap-6">
+        {/* Sidebar filter */}
+        <aside className="space-y-4">
+          <FilterBar
+            allRegions={allRegions}
+            allSegments={allSegments}
+            allCategories={allCategories}
+            filters={filters}
+            setFilters={setFilters}
+            dateBounds={dateBounds}
+            onReset={onReset}
+          />
+          <div className="card p-4 text-xs text-muted space-y-1">
+            <div>총 행 수 (원본): <span className="num text-ink">{fmtInt(data ? data.length : 0)}</span></div>
+            <div>필터 후 행 수: <span className="num text-ink">{fmtInt(filteredRows.length)}</span></div>
+            <div>기간: <span className="num text-ink">{filters.from || '-'} ~ {filters.to || '-'}</span></div>
+          </div>
+        </aside>
+
+        {/* Content */}
+        <section className="space-y-6">
+          {/* KPI row */}
+          <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-3">
+            <KpiCard label="총 매출" value={fmtMoney(kpi.rev)} sub={`${fmtInt(kpi.orders)} orders`} />
+            <KpiCard label="총 이익" value={fmtMoney(kpi.prof)} tone="good" />
+            <KpiCard label="평균 마진" value={fmtPct(kpi.margin)} tone={kpi.margin >= 40 ? 'good' : kpi.margin >= 25 ? 'warn' : 'bad'} />
+            <KpiCard label="총 판매수량" value={fmtInt(kpi.units)} />
+            <KpiCard label="주문 수" value={fmtInt(kpi.orders)} />
+            <KpiCard label="평균 주문가치" value={fmtMoney(kpi.aov)} />
+          </div>
+
+          {filteredRows.length === 0 ? <EmptyView /> : (
+            <>
+              {/* Charts row 1 */}
+              <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+                <div className="card p-4">
+                  <div className="flex items-baseline justify-between mb-2">
+                    <h2 className="font-semibold text-sm">일자별 매출 & 이익 추이</h2>
+                    <span className="text-xs text-muted">{dailyRevenue.length} days</span>
+                  </div>
+                  <div style={{ width: '100%', height: 260 }}>
+                    <ResponsiveContainer>
+                      <LineChart data={dailyRevenue} margin={{ top: 6, right: 12, left: 0, bottom: 0 }}>
+                        <CartesianGrid stroke="#EFEEEA" strokeDasharray="3 3" />
+                        <XAxis dataKey="date" tick={{ fontSize: 11, fill: '#6B6A63' }} tickMargin={6} minTickGap={30} />
+                        <YAxis tick={{ fontSize: 11, fill: '#6B6A63' }} tickFormatter={fmtShort} width={60} />
+                        <Tooltip formatter={(v) => fmtMoney(v)} labelStyle={{ fontSize: 12 }} contentStyle={{ fontSize: 12, borderRadius: 4 }} />
+                        <Legend wrapperStyle={{ fontSize: 12 }} />
+                        <Line type="monotone" dataKey="revenue" name="매출" stroke={PALETTE[0]} strokeWidth={2} dot={false} />
+                        <Line type="monotone" dataKey="profit"  name="이익" stroke={PALETTE[1]} strokeWidth={2} dot={false} />
+                      </LineChart>
+                    </ResponsiveContainer>
+                  </div>
+                </div>
+
+                <div className="card p-4">
+                  <div className="flex items-baseline justify-between mb-2">
+                    <h2 className="font-semibold text-sm">Segment별 매출 비중</h2>
+                    <span className="text-xs text-muted">{bySegment.length} segments</span>
+                  </div>
+                  <div style={{ width: '100%', height: 260 }}>
+                    <ResponsiveContainer>
+                      <PieChart>
+                        <Pie data={bySegment} dataKey="value" nameKey="key" innerRadius={55} outerRadius={90} paddingAngle={1}>
+                          {bySegment.map((_, i) => <Cell key={i} fill={PALETTE[i % PALETTE.length]} />)}
+                        </Pie>
+                        <Tooltip formatter={(v) => fmtMoney(v)} contentStyle={{ fontSize: 12, borderRadius: 4 }} />
+                        <Legend wrapperStyle={{ fontSize: 12 }} />
+                      </PieChart>
+                    </ResponsiveContainer>
+                  </div>
+                </div>
+              </div>
+
+              {/* Charts row 2 */}
+              <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+                <div className="card p-4">
+                  <div className="flex items-baseline justify-between mb-2">
+                    <h2 className="font-semibold text-sm">Region별 매출 & 이익</h2>
+                    <span className="text-xs text-muted">{byRegion.length} regions</span>
+                  </div>
+                  <div style={{ width: '100%', height: 260 }}>
+                    <ResponsiveContainer>
+                      <BarChart data={byRegion} margin={{ top: 6, right: 12, left: 0, bottom: 0 }}>
+                        <CartesianGrid stroke="#EFEEEA" strokeDasharray="3 3" />
+                        <XAxis dataKey="key" tick={{ fontSize: 11, fill: '#6B6A63' }} />
+                        <YAxis tick={{ fontSize: 11, fill: '#6B6A63' }} tickFormatter={fmtShort} width={60} />
+                        <Tooltip formatter={(v) => fmtMoney(v)} contentStyle={{ fontSize: 12, borderRadius: 4 }} />
+                        <Legend wrapperStyle={{ fontSize: 12 }} />
+                        <Bar dataKey="revenue" name="매출" fill={PALETTE[0]} />
+                        <Bar dataKey="profit"  name="이익" fill={PALETTE[1]} />
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
+                </div>
+
+                <div className="card p-4">
+                  <div className="flex items-baseline justify-between mb-2">
+                    <h2 className="font-semibold text-sm">Category별 매출 & 이익</h2>
+                    <span className="text-xs text-muted">{byCategory.length} categories</span>
+                  </div>
+                  <div style={{ width: '100%', height: 260 }}>
+                    <ResponsiveContainer>
+                      <BarChart data={byCategory} margin={{ top: 6, right: 12, left: 0, bottom: 0 }} layout="vertical">
+                        <CartesianGrid stroke="#EFEEEA" strokeDasharray="3 3" />
+                        <XAxis type="number" tick={{ fontSize: 11, fill: '#6B6A63' }} tickFormatter={fmtShort} />
+                        <YAxis type="category" dataKey="key" tick={{ fontSize: 11, fill: '#6B6A63' }} width={90} />
+                        <Tooltip formatter={(v) => fmtMoney(v)} contentStyle={{ fontSize: 12, borderRadius: 4 }} />
+                        <Legend wrapperStyle={{ fontSize: 12 }} />
+                        <Bar dataKey="revenue" name="매출" fill={PALETTE[0]} />
+                        <Bar dataKey="profit"  name="이익" fill={PALETTE[4]} />
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
+                </div>
+              </div>
+
+              {/* Top products */}
+              <div className="card p-4">
+                <div className="flex items-baseline justify-between mb-2">
+                  <h2 className="font-semibold text-sm">Top 10 제품 (매출 기준)</h2>
+                  <span className="text-xs text-muted">매출·이익·수량 동시 비교</span>
+                </div>
+                <div style={{ width: '100%', height: 300 }}>
+                  <ResponsiveContainer>
+                    <BarChart data={topProducts} margin={{ top: 6, right: 12, left: 0, bottom: 0 }}>
+                      <CartesianGrid stroke="#EFEEEA" strokeDasharray="3 3" />
+                      <XAxis dataKey="key" tick={{ fontSize: 11, fill: '#6B6A63' }} angle={-15} textAnchor="end" height={50} interval={0} />
+                      <YAxis yAxisId="left"  tick={{ fontSize: 11, fill: '#6B6A63' }} tickFormatter={fmtShort} width={60} />
+                      <YAxis yAxisId="right" orientation="right" tick={{ fontSize: 11, fill: '#6B6A63' }} tickFormatter={fmtShort} width={50} />
+                      <Tooltip formatter={(v, name) => name === '수량' ? fmtInt(v) : fmtMoney(v)} contentStyle={{ fontSize: 12, borderRadius: 4 }} />
+                      <Legend wrapperStyle={{ fontSize: 12 }} />
+                      <Bar yAxisId="left" dataKey="revenue" name="매출" fill={PALETTE[0]} />
+                      <Bar yAxisId="left" dataKey="profit"  name="이익" fill={PALETTE[1]} />
+                      <Bar yAxisId="right" dataKey="units" name="수량"  fill={PALETTE[3]} />
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
+              </div>
+
+              {/* Raw data table */}
+              <div className="card p-0 overflow-hidden">
+                <div className="px-4 py-3 border-b border-border flex items-center justify-between">
+                  <h2 className="font-semibold text-sm">원본 데이터</h2>
+                  <div className="text-xs text-muted num">
+                    {fmtInt(page * perPage + 1)}–{fmtInt(Math.min((page+1) * perPage, filteredRows.length))} / {fmtInt(filteredRows.length)}
+                  </div>
+                </div>
+                <div className="overflow-auto" style={{ maxHeight: 420 }}>
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr>
+                        <th>OrderID</th><th>Date</th><th>Region</th><th>Segment</th><th>Category</th><th>Product</th>
+                        <th className="text-right">Units</th><th className="text-right">UnitPrice</th>
+                        <th className="text-right">Revenue</th><th className="text-right">Profit</th><th className="text-right">Margin%</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {pageRows.map((r, i) => (
+                        <tr key={i}>
+                          <td className="num text-xs">{r.OrderID}</td>
+                          <td className="num text-xs">{r.Date}</td>
+                          <td>{r.Region}</td>
+                          <td>{r.Segment}</td>
+                          <td>{r.Category}</td>
+                          <td>{r.Product}</td>
+                          <td className="num text-right">{fmtInt(r.UnitsSold)}</td>
+                          <td className="num text-right">{fmtMoney(r.UnitPrice)}</td>
+                          <td className="num text-right">{fmtMoney(r.TotalRevenue)}</td>
+                          <td className="num text-right">{fmtMoney(r.Profit)}</td>
+                          <td className="num text-right">{fmtPct(Number(r.Margin))}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                <div className="px-4 py-2 border-t border-border flex items-center justify-between text-xs">
+                  <div className="text-muted">페이지 {page + 1} / {pages}</div>
+                  <div className="flex gap-1">
+                    <button disabled={page === 0} onClick={() => setPage(0)} className="chip disabled:opacity-40">«</button>
+                    <button disabled={page === 0} onClick={() => setPage(p => Math.max(0, p - 1))} className="chip disabled:opacity-40">이전</button>
+                    <button disabled={page >= pages - 1} onClick={() => setPage(p => Math.min(pages - 1, p + 1))} className="chip disabled:opacity-40">다음</button>
+                    <button disabled={page >= pages - 1} onClick={() => setPage(pages - 1)} className="chip disabled:opacity-40">»</button>
+                  </div>
+                </div>
+              </div>
+            </>
+          )}
+        </section>
+      </main>
+
+      <footer className="max-w-[1400px] mx-auto px-6 py-6 text-xs text-muted">
+        Data source: Google Sheets · gviz JSON endpoint ·
+        <a className="underline ml-1" target="_blank" rel="noopener" href={`https://docs.google.com/spreadsheets/d/${CONFIG.SHEET_ID}/edit`}>원본 시트 열기</a>
+      </footer>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
